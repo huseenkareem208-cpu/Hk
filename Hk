@@ -1,0 +1,2068 @@
+import 'dart:convert';
+import 'dart:math' as math;
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart';
+import 'package:http/http.dart' as http;
+import 'package:geolocator/geolocator.dart';
+import '../../core/services/api_service.dart';
+import '../../core/constants/api_endpoints.dart';
+
+/// اجعلها true فقط بعد أن يدعم السيرفر حقل boundary
+const bool kSendBoundary = false;
+
+const Color kGovGreen = Color(0xFF123D32);
+const Color kGovGold = Color(0xFFC9A227);
+const Color kGovCream = Color(0xFFF8F5EE);
+
+enum DrawMode { point, polygon, rectangle }
+
+class WorkplaceFormScreen extends StatefulWidget {
+  final dynamic workplace;
+  const WorkplaceFormScreen({super.key, this.workplace});
+
+  @override
+  State<WorkplaceFormScreen> createState() => _WorkplaceFormScreenState();
+}
+
+class _WorkplaceFormScreenState extends State<WorkplaceFormScreen> {
+  final _api = ApiService();
+  final _formKey = GlobalKey<FormState>();
+  final GlobalKey _mapKey = GlobalKey();
+
+  late TextEditingController _nameController;
+  late TextEditingController _radiusController;
+  late TextEditingController _startController;
+  late TextEditingController _endController;
+  final _searchController = TextEditingController();
+
+  late LatLng _selectedLocation;
+  late MapController _mapController;
+
+  bool _isLoading = false;
+  bool _isSearching = false;
+  bool _isSatelliteView = false;
+  bool _isFullscreen = false;
+  bool _isLoadingLocation = false;
+  bool _isFetchingBoundary = false;
+
+  // أثناء سحب أي مقبض نوقف تحريك الخريطة
+  bool _isDraggingHandle = false;
+
+  // حالة تعديل الشكل
+  bool _isShapeEditable = false;
+
+  DrawMode _mode = DrawMode.point;
+  List<LatLng> _mainPolygon = [];
+  final List<LatLng> _draftPoints = [];
+
+  bool get _isEdit => widget.workplace != null;
+
+  final LatLngBounds _iraqBounds = LatLngBounds(
+    const LatLng(29.0588, 38.7923),
+    const LatLng(37.3830, 48.5674),
+  );
+
+  @override
+  void initState() {
+    super.initState();
+    _nameController =
+        TextEditingController(text: widget.workplace?['name'] ?? '');
+    _radiusController = TextEditingController(
+        text: (widget.workplace?['radiusInMeters'] ?? 100).toString());
+    _startController = TextEditingController(
+        text: widget.workplace?['workingStartTime'] ?? '08:00');
+    _endController = TextEditingController(
+        text: widget.workplace?['workingEndTime'] ?? '16:00');
+
+    final lat = double.tryParse(
+            widget.workplace?['latitude']?.toString() ?? '33.3152') ??
+        33.3152;
+    final lng = double.tryParse(
+            widget.workplace?['longitude']?.toString() ?? '44.3951') ??
+        44.3951;
+
+    _selectedLocation = LatLng(lat, lng);
+    _mapController = MapController();
+
+    final b = widget.workplace?['boundary'];
+    if (b is List) {
+      try {
+        _mainPolygon = b
+            .map<LatLng>((p) =>
+                LatLng((p[0] as num).toDouble(), (p[1] as num).toDouble()))
+            .toList();
+      } catch (_) {}
+    }
+  }
+
+  @override
+  void dispose() {
+    _nameController.dispose();
+    _radiusController.dispose();
+    _startController.dispose();
+    _endController.dispose();
+    _searchController.dispose();
+    _mapController.dispose();
+    super.dispose();
+  }
+
+  void _snack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(
+        content: Text(msg),
+        backgroundColor: kGovGreen,
+        behavior: SnackBarBehavior.floating,
+      ));
+  }
+
+  void _setDragging(bool v) {
+    if (_isDraggingHandle != v && mounted) {
+      setState(() => _isDraggingHandle = v);
+    }
+  }
+
+  // =====================================================
+  //               تحريك وتعديل الشكل (Handles)
+  // =====================================================
+
+  void _updateVertex(int index, LatLng newPoint) {
+    if (index < 0 || index >= _mainPolygon.length) return;
+
+    setState(() {
+      _mainPolygon[index] = newPoint;
+      _recalcCenterAndRadius();
+    });
+  }
+
+  void _moveShape(LatLng delta) {
+    if (_mainPolygon.isEmpty) return;
+
+    setState(() {
+      _mainPolygon = _mainPolygon
+          .map((p) => LatLng(
+                p.latitude + delta.latitude,
+                p.longitude + delta.longitude,
+              ))
+          .toList();
+
+      _selectedLocation = LatLng(
+        _selectedLocation.latitude + delta.latitude,
+        _selectedLocation.longitude + delta.longitude,
+      );
+    });
+  }
+
+  void _updateRadius(LatLng newEdgePoint) {
+    final dist = const Distance().as(
+      LengthUnit.Meter,
+      _selectedLocation,
+      newEdgePoint,
+    );
+    if (dist < 1) return;
+    setState(() {
+      _radiusController.text = dist.ceil().toString();
+    });
+  }
+
+  void _recalcCenterAndRadius() {
+    if (_mainPolygon.length < 3) return;
+
+    final bounds = LatLngBounds.fromPoints(_mainPolygon);
+    _selectedLocation = bounds.center;
+    final maxDist = _maxDistanceFromCenter(_selectedLocation, _mainPolygon);
+    _radiusController.text = maxDist.ceil().toString();
+  }
+
+  // =====================================================
+  //                    أدوات الأشكال
+  // =====================================================
+
+  List<LatLng> _ring(List ring) => ring
+      .map<LatLng>(
+          (p) => LatLng((p[1] as num).toDouble(), (p[0] as num).toDouble()))
+      .toList();
+
+  List<List<LatLng>> _parseGeoJson(dynamic g) {
+    if (g is! Map) return [];
+    final c = g['coordinates'];
+    if (g['type'] == 'Polygon') return [_ring(c[0])];
+    if (g['type'] == 'MultiPolygon') return [for (final p in c) _ring(p[0])];
+    return [];
+  }
+
+  List<LatLng> _rectFrom(LatLng a, LatLng b) => [
+        a,
+        LatLng(a.latitude, b.longitude),
+        b,
+        LatLng(b.latitude, a.longitude),
+      ];
+
+  double _maxDistanceFromCenter(LatLng center, List<LatLng> pts) {
+    if (pts.isEmpty) return 100;
+    const dist = Distance();
+    return pts.map((p) => dist(center, p)).reduce(math.max);
+  }
+
+  void _clearShapes() {
+    _mainPolygon = [];
+    _draftPoints.clear();
+    _isShapeEditable = false;
+  }
+
+  Future<void> _applyShape(List<LatLng> points) async {
+    final bounds = LatLngBounds.fromPoints(points);
+    final center = bounds.center;
+    final radius = _maxDistanceFromCenter(center, points);
+
+    setState(() {
+      _mode = DrawMode.point;
+      _draftPoints.clear();
+      _mainPolygon = points;
+      _selectedLocation = center;
+      _radiusController.text = radius.ceil().toString();
+      _isShapeEditable = true;
+    });
+
+    try {
+      _mapController.fitCamera(CameraFit.bounds(
+        bounds: bounds,
+        padding: const EdgeInsets.all(80),
+      ));
+    } catch (_) {}
+  }
+
+  // =====================================================
+  //                   موقعي الحالي
+  // =====================================================
+
+  Future<void> _goToMyLocation() async {
+    setState(() => _isLoadingLocation = true);
+    try {
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        _snack('خدمة الموقع غير مُفعّلة، قم بتشغيل GPS');
+        return;
+      }
+
+      LocationPermission perm = await Geolocator.checkPermission();
+      if (perm == LocationPermission.denied) {
+        perm = await Geolocator.requestPermission();
+      }
+      if (perm == LocationPermission.denied ||
+          perm == LocationPermission.deniedForever) {
+        _snack('يجب السماح بالوصول للموقع');
+        return;
+      }
+
+      final pos = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+        ),
+      );
+
+      if (!mounted) return;
+
+      final loc = LatLng(pos.latitude, pos.longitude);
+      setState(() {
+        _clearShapes();
+        _selectedLocation = loc;
+      });
+      _mapController.move(loc, 17);
+      _snack('تم الانتقال إلى موقعك');
+    } catch (e) {
+      _snack('تعذر تحديد موقعك');
+    } finally {
+      if (mounted) setState(() => _isLoadingLocation = false);
+    }
+  }
+
+  // =====================================================
+  //                       البحث
+  // =====================================================
+
+  Future<void> _searchAddress(String query) async {
+    if (query.trim().isEmpty) {
+      _snack('اكتب عنواناً للبحث');
+      return;
+    }
+
+    setState(() => _isSearching = true);
+
+    try {
+      final localRes = await _api.dio.get(
+        ApiEndpoints.presetLocationsSearch,
+        queryParameters: {'q': query.trim()},
+      );
+
+      final localResults = localRes.data as List;
+
+      if (localResults.isNotEmpty) {
+        if (!mounted) return;
+        _showLocalResults(localResults);
+        return;
+      }
+
+      final url =
+          'https://nominatim.openstreetmap.org/search?q=${Uri.encodeComponent(query)}&format=json&limit=5&countrycodes=iq&addressdetails=1&polygon_geojson=1';
+
+      final response = await http.get(
+        Uri.parse(url),
+        headers: {'User-Agent': 'AttendanceApp/1.0'},
+      ).timeout(const Duration(seconds: 20));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as List;
+        if (data.isEmpty) {
+          if (!mounted) return;
+          _showNotFoundDialog(query);
+          return;
+        }
+        if (!mounted) return;
+        _showResultsBottomSheet(data);
+      } else {
+        _snack('فشل البحث');
+      }
+    } catch (e) {
+      _snack('تعذر البحث');
+    } finally {
+      if (mounted) setState(() => _isSearching = false);
+    }
+  }
+
+  void _showLocalResults(List results) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) => Container(
+        height: MediaQuery.of(context).size.height * 0.65,
+        decoration: const BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Center(
+              child: Container(
+                margin: const EdgeInsets.only(top: 12),
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: Colors.grey.shade300,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
+              child: Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: kGovGreen.withOpacity(0.1),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: const Icon(Icons.verified, color: kGovGreen),
+                  ),
+                  const SizedBox(width: 12),
+                  const Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('مواقع حكومية جاهزة',
+                            style: TextStyle(
+                                fontSize: 16, fontWeight: FontWeight.bold)),
+                        SizedBox(height: 2),
+                        Text('من قاعدة البيانات الرسمية',
+                            style: TextStyle(
+                                fontSize: 11, color: Colors.grey)),
+                      ],
+                    ),
+                  ),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 10, vertical: 5),
+                    decoration: BoxDecoration(
+                      color: kGovGold.withOpacity(0.15),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Text('${results.length}',
+                        style: const TextStyle(
+                            color: kGovGold,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 13)),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1),
+            Expanded(
+              child: ListView.builder(
+                padding: const EdgeInsets.all(12),
+                itemCount: results.length,
+                itemBuilder: (context, i) => _localResultCard(results[i]),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _localResultCard(dynamic r) {
+    final type = r['type'] ?? 'other';
+    final city = r['city'] ?? '';
+    final radius = r['radiusInMeters'] ?? 150;
+    final hasBoundary =
+        r['boundary'] != null && (r['boundary'] as List).isNotEmpty;
+
+    IconData icon;
+    Color color;
+    switch (type) {
+      case 'ministry':
+        icon = Icons.account_balance;
+        color = kGovGreen;
+        break;
+      case 'authority':
+        icon = Icons.gavel;
+        color = kGovGold;
+        break;
+      case 'department':
+        icon = Icons.business;
+        color = Colors.blue;
+        break;
+      default:
+        icon = Icons.location_city;
+        color = Colors.grey;
+    }
+
+    return Card(
+      elevation: 0,
+      margin: const EdgeInsets.only(bottom: 8),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(12),
+        side: BorderSide(color: Colors.grey.shade200),
+      ),
+      child: InkWell(
+        onTap: () {
+          Navigator.pop(context);
+          _applyLocalResult(r);
+        },
+        borderRadius: BorderRadius.circular(12),
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: color.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Icon(icon, color: color, size: 22),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            r['name'] ?? '',
+                            style: const TextStyle(
+                                fontSize: 14, fontWeight: FontWeight.bold),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        if (hasBoundary)
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 6, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: kGovGreen.withOpacity(0.15),
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                            child: const Text('حدود',
+                                style: TextStyle(
+                                    fontSize: 9,
+                                    color: kGovGreen,
+                                    fontWeight: FontWeight.bold)),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Row(
+                      children: [
+                        if (city.isNotEmpty) ...[
+                          const Icon(Icons.location_on,
+                              size: 12, color: Colors.grey),
+                          const SizedBox(width: 3),
+                          Flexible(
+                            child: Text(city,
+                                style: const TextStyle(
+                                    fontSize: 11, color: Colors.grey),
+                                overflow: TextOverflow.ellipsis),
+                          ),
+                          const SizedBox(width: 10),
+                        ],
+                        const Icon(Icons.adjust,
+                            size: 12, color: Colors.grey),
+                        const SizedBox(width: 3),
+                        Text('$radius م',
+                            style: const TextStyle(
+                                fontSize: 11, color: Colors.grey)),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+              const Icon(Icons.arrow_forward_ios,
+                  size: 14, color: Colors.grey),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _applyLocalResult(dynamic r) async {
+    final lat = double.parse(r['latitude'].toString());
+    final lng = double.parse(r['longitude'].toString());
+    final loc = LatLng(lat, lng);
+
+    setState(() {
+      _nameController.text = r['name'] ?? '';
+      _radiusController.text = (r['radiusInMeters'] ?? 150).toString();
+      _selectedLocation = loc;
+      _mainPolygon = [];
+      _mode = DrawMode.point;
+      _isShapeEditable = false;
+    });
+
+    try {
+      _mapController.move(loc, 18);
+    } catch (_) {}
+
+    final boundary = r['boundary'];
+    if (boundary != null && (boundary as List).length > 2) {
+      final points = boundary
+          .map<LatLng>((p) =>
+              LatLng((p[0] as num).toDouble(), (p[1] as num).toDouble()))
+          .toList();
+      setState(() {
+        _mainPolygon = points;
+        _isShapeEditable = true;
+      });
+      try {
+        _mapController.fitCamera(CameraFit.bounds(
+          bounds: LatLngBounds.fromPoints(points),
+          padding: const EdgeInsets.all(80),
+        ));
+      } catch (_) {}
+      _snack('✅ ${r['name']}');
+      return;
+    }
+
+    setState(() => _isFetchingBoundary = true);
+    _snack('⏳ جاري جلب حدود المبنى...');
+
+    try {
+      final res = await _api.dio.get(
+        '${ApiEndpoints.presetLocations}/${r['id']}/fetch-boundary',
+      );
+
+      final newBoundary = res.data['boundary'];
+      final cached = res.data['cached'] == true;
+
+      if (newBoundary != null && (newBoundary as List).length > 2) {
+        final points = newBoundary
+            .map<LatLng>((p) =>
+                LatLng((p[0] as num).toDouble(), (p[1] as num).toDouble()))
+            .toList();
+
+        setState(() {
+          _mainPolygon = points;
+          _radiusController.text = (r['radiusInMeters'] ?? 150).toString();
+          _isShapeEditable = true;
+        });
+
+        try {
+          _mapController.fitCamera(CameraFit.bounds(
+            bounds: LatLngBounds.fromPoints(points),
+            padding: const EdgeInsets.all(80),
+          ));
+        } catch (_) {}
+
+        _snack(cached ? '✅ حدود محفوظة' : '✅ تم جلب الحدود');
+      } else {
+        _snack('⚠️ لم تُوجد حدود، ارسمها يدوياً');
+      }
+    } catch (e) {
+      _snack('⚠️ تعذر جلب الحدود، ارسمها يدوياً');
+    } finally {
+      if (mounted) setState(() => _isFetchingBoundary = false);
+    }
+  }
+
+  Future<void> _selectResult(Map item) async {
+    final polys = _parseGeoJson(item['geojson']);
+    final point = LatLng(double.parse(item['lat']), double.parse(item['lon']));
+
+    final displayName = item['display_name']?.toString() ?? '';
+    if (_nameController.text.isEmpty && displayName.isNotEmpty) {
+      _nameController.text = displayName.split(',').first.trim();
+    }
+
+    if (polys.isEmpty) {
+      setState(() {
+        _clearShapes();
+        _selectedLocation = point;
+      });
+      try {
+        _mapController.move(point, 17);
+      } catch (_) {}
+      _snack('لا توجد حدود، استخدم الرسم اليدوي');
+      return;
+    }
+
+    polys.sort((a, b) => b.length.compareTo(a.length));
+    await _applyShape(polys.first);
+  }
+
+  void _showNotFoundDialog(String query) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Row(
+          children: const [
+            Icon(Icons.search_off, color: kGovGreen),
+            SizedBox(width: 8),
+            Text('لم يتم العثور'),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('لم يتم العثور على "$query".'),
+            const SizedBox(height: 12),
+            const Text('💡 نصائح:',
+                style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 6),
+            const Text('• جرب البحث بالإنجليزية'),
+            const SizedBox(height: 4),
+            const Text('• أو ارسم الحدود يدوياً'),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('حسناً', style: TextStyle(color: kGovGreen)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showResultsBottomSheet(List<dynamic> results) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) => Container(
+        height: MediaQuery.of(context).size.height * 0.55,
+        decoration: const BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+        ),
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Center(
+              child: Container(
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: Colors.grey.shade300,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            const Row(
+              children: [
+                Icon(Icons.location_searching, color: kGovGreen),
+                SizedBox(width: 8),
+                Text('نتائج Nominatim',
+                    style:
+                        TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Expanded(
+              child: ListView.builder(
+                itemCount: results.length,
+                itemBuilder: (context, i) {
+                  final item = results[i];
+                  final displayName = item['display_name'] ?? '';
+                  final hasShape = _parseGeoJson(item['geojson']).isNotEmpty;
+                  return Card(
+                    elevation: 0,
+                    margin: const EdgeInsets.only(bottom: 8),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      side: BorderSide(color: Colors.grey.shade200),
+                    ),
+                    child: ListTile(
+                      leading: Container(
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          color: hasShape
+                              ? kGovGreen.withOpacity(0.1)
+                              : kGovGold.withOpacity(0.15),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Icon(
+                          hasShape ? Icons.crop_square : Icons.location_on,
+                          color: hasShape ? kGovGreen : kGovGold,
+                          size: 20,
+                        ),
+                      ),
+                      title: Text(
+                        displayName,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 13),
+                      ),
+                      subtitle: Text(
+                        hasShape ? '✅ يحتوي على حدود' : '📍 نقطة فقط',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: hasShape ? kGovGreen : Colors.grey.shade600,
+                        ),
+                      ),
+                      onTap: () {
+                        Navigator.pop(context);
+                        _selectResult(item);
+                      },
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // =====================================================
+  //                  الرسم اليدوي
+  // =====================================================
+
+  void _setMode(DrawMode m) {
+    setState(() {
+      _mode = m;
+      _draftPoints.clear();
+      _isShapeEditable = false;
+    });
+  }
+
+  void _onMapTap(LatLng point) {
+    if (_isShapeEditable) return;
+
+    switch (_mode) {
+      case DrawMode.point:
+        setState(() {
+          _clearShapes();
+          _selectedLocation = point;
+        });
+        break;
+      case DrawMode.polygon:
+        setState(() => _draftPoints.add(point));
+        break;
+      case DrawMode.rectangle:
+        if (_draftPoints.isEmpty) {
+          setState(() => _draftPoints.add(point));
+        } else {
+          _applyShape(_rectFrom(_draftPoints.first, point));
+        }
+        break;
+    }
+  }
+
+  void _finishPolygon() {
+    if (_draftPoints.length < 3) return;
+    _applyShape(List<LatLng>.from(_draftPoints));
+  }
+
+  String get _mapHint {
+    if (_isShapeEditable) {
+      return 'اسحب الرؤوس الذهبية أو المركز لتحريك الشكل';
+    }
+    switch (_mode) {
+      case DrawMode.point:
+        return 'اضغط على الخريطة أو ابحث';
+      case DrawMode.polygon:
+        return 'اضغط لإضافة زوايا (${_draftPoints.length}) ثم إنهاء';
+      case DrawMode.rectangle:
+        return _draftPoints.isEmpty
+            ? 'اضغط على الزاوية الأولى'
+            : 'اضغط على الزاوية المقابلة';
+    }
+  }
+
+  // =====================================================
+  //                       الحفظ
+  // =====================================================
+
+  int _minutes(String t) {
+    final p = t.split(':');
+    return (int.tryParse(p[0]) ?? 0) * 60 +
+        (int.tryParse(p.length > 1 ? p[1] : '0') ?? 0);
+  }
+
+  Future<void> _save([StateSetter? setSheetState]) async {
+    if (!_formKey.currentState!.validate()) return;
+
+    if (_minutes(_endController.text) <= _minutes(_startController.text)) {
+      _snack('وقت الانتهاء يجب أن يكون بعد البدء');
+      return;
+    }
+
+    void setLoading(bool v) {
+      if (!mounted) return;
+      setState(() => _isLoading = v);
+      setSheetState?.call(() {});
+    }
+
+    setLoading(true);
+    try {
+      final data = <String, dynamic>{
+        'name': _nameController.text.trim(),
+        'latitude': _selectedLocation.latitude,
+        'longitude': _selectedLocation.longitude,
+        'radiusInMeters': int.tryParse(_radiusController.text.trim()) ?? 100,
+        'workingStartTime': _startController.text.trim(),
+        'workingEndTime': _endController.text.trim(),
+      };
+
+      if (kSendBoundary && _mainPolygon.isNotEmpty) {
+        data['boundary'] =
+            _mainPolygon.map((p) => [p.latitude, p.longitude]).toList();
+      }
+
+      if (_isEdit) {
+        await _api.dio.patch(
+          '${ApiEndpoints.workplaces}/${widget.workplace['id']}',
+          data: data,
+        );
+      } else {
+        await _api.dio.post(ApiEndpoints.workplaces, data: data);
+      }
+
+      if (!mounted) return;
+      Navigator.pop(context);
+      Navigator.pop(context, true);
+    } catch (e) {
+      _snack('فشل الحفظ');
+      setLoading(false);
+    }
+  }
+
+  Future<void> _pickTime(bool isStart) async {
+    final controller = isStart ? _startController : _endController;
+    final initial = controller.text.split(':');
+    final time = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay(
+        hour: int.tryParse(initial[0]) ?? 8,
+        minute: int.tryParse(initial.length > 1 ? initial[1] : '0') ?? 0,
+      ),
+    );
+    if (time != null) {
+      controller.text =
+          '${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}';
+      setState(() {});
+    }
+  }
+
+  void _copyCoordinates() {
+    final text =
+        '${_selectedLocation.latitude.toStringAsFixed(6)}, ${_selectedLocation.longitude.toStringAsFixed(6)}';
+    Clipboard.setData(ClipboardData(text: text));
+    _snack('تم النسخ');
+  }
+
+  // =====================================================
+  //                  مقابض التحريك (Handles)
+  // =====================================================
+
+  Widget _buildVertexHandle(int index) {
+    return MouseRegion(
+      cursor: SystemMouseCursors.grab,
+      child: GestureDetector(
+        onPanStart: (_) => _setDragging(true),
+        onPanEnd: (_) => _setDragging(false),
+        onPanCancel: () => _setDragging(false),
+        onPanUpdate: (details) {
+          if (index < 0 || index >= _mainPolygon.length) return;
+          final currentVertex = _mainPolygon[index];
+
+          final camera = _mapController.camera;
+          final pt = camera.latLngToScreenPoint(currentVertex);
+          final newPoint = math.Point<double>(
+            pt.x + details.delta.dx,
+            pt.y + details.delta.dy,
+          );
+          final newLatLng = camera.pointToLatLng(newPoint);
+          _updateVertex(index, newLatLng);
+        },
+        child: Container(
+          width: 28,
+          height: 28,
+          decoration: BoxDecoration(
+            color: kGovGold,
+            shape: BoxShape.circle,
+            border: Border.all(color: Colors.white, width: 3),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.3),
+                blurRadius: 6,
+                offset: const Offset(0, 2),
+              ),
+            ],
+          ),
+          child: const Icon(Icons.open_with, color: Colors.white, size: 12),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCenterHandle() {
+    return MouseRegion(
+      cursor: SystemMouseCursors.move,
+      child: GestureDetector(
+        onPanStart: (_) => _setDragging(true),
+        onPanEnd: (_) => _setDragging(false),
+        onPanCancel: () => _setDragging(false),
+        onPanUpdate: (details) {
+          if (_mainPolygon.isEmpty) return;
+
+          final currentCenter = LatLngBounds.fromPoints(_mainPolygon).center;
+          final camera = _mapController.camera;
+          final pt = camera.latLngToScreenPoint(currentCenter);
+          final newPoint = math.Point<double>(
+            pt.x + details.delta.dx,
+            pt.y + details.delta.dy,
+          );
+          final newLatLng = camera.pointToLatLng(newPoint);
+
+          final delta = LatLng(
+            newLatLng.latitude - currentCenter.latitude,
+            newLatLng.longitude - currentCenter.longitude,
+          );
+          _moveShape(delta);
+        },
+        child: Container(
+          width: 44,
+          height: 44,
+          decoration: BoxDecoration(
+            color: kGovGreen.withOpacity(0.9),
+            shape: BoxShape.circle,
+            border: Border.all(color: kGovGold, width: 3),
+            boxShadow: [
+              BoxShadow(
+                color: kGovGreen.withOpacity(0.5),
+                blurRadius: 12,
+                spreadRadius: 2,
+              ),
+            ],
+          ),
+          child: const Icon(Icons.open_with, color: kGovGold, size: 20),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildRadiusHandle() {
+    const dist = Distance();
+
+    return MouseRegion(
+      cursor: SystemMouseCursors.resizeLeftRight,
+      child: GestureDetector(
+        onPanStart: (_) => _setDragging(true),
+        onPanEnd: (_) => _setDragging(false),
+        onPanCancel: () => _setDragging(false),
+        onPanUpdate: (details) {
+          final currentRadius =
+              double.tryParse(_radiusController.text) ?? 100;
+          final currentEdge =
+              dist.offset(_selectedLocation, currentRadius, 90);
+
+          final camera = _mapController.camera;
+          final pt = camera.latLngToScreenPoint(currentEdge);
+          final newPoint = math.Point<double>(
+            pt.x + details.delta.dx,
+            pt.y + details.delta.dy,
+          );
+          final newLatLng = camera.pointToLatLng(newPoint);
+          _updateRadius(newLatLng);
+        },
+        child: Container(
+          width: 26,
+          height: 26,
+          decoration: BoxDecoration(
+            color: kGovGold,
+            shape: BoxShape.circle,
+            border: Border.all(color: Colors.white, width: 3),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.3),
+                blurRadius: 6,
+              ),
+            ],
+          ),
+          child: const Icon(Icons.swap_horiz, color: Colors.white, size: 14),
+        ),
+      ),
+    );
+  }
+
+  // =====================================================
+  //                     Marker احترافي
+  // =====================================================
+
+  Widget _buildProfessionalMarker() {
+    return Container(
+      width: 54,
+      height: 54,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: kGovGreen,
+        border: Border.all(color: kGovGold, width: 3),
+        boxShadow: [
+          BoxShadow(
+            color: kGovGreen.withOpacity(0.4),
+            blurRadius: 15,
+            spreadRadius: 2,
+          ),
+        ],
+      ),
+      child: const Icon(
+        Icons.account_balance,
+        color: kGovGold,
+        size: 26,
+      ),
+    );
+  }
+
+  // =====================================================
+  //                     عناصر الواجهة
+  // =====================================================
+
+  Widget _floatingButton({
+    required IconData icon,
+    required VoidCallback onPressed,
+    String? tooltip,
+    Color? bgColor,
+    Color? iconColor,
+    bool isLoading = false,
+  }) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      decoration: BoxDecoration(
+        color: bgColor ?? Colors.white,
+        shape: BoxShape.circle,
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.12),
+            blurRadius: 10,
+            offset: const Offset(0, 3),
+          ),
+        ],
+      ),
+      child: Tooltip(
+        message: tooltip ?? '',
+        child: Material(
+          color: Colors.transparent,
+          child: InkWell(
+            onTap: onPressed,
+            customBorder: const CircleBorder(),
+            child: SizedBox(
+              width: 48,
+              height: 48,
+              child: isLoading
+                  ? const Padding(
+                      padding: EdgeInsets.all(14),
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : Icon(
+                      icon,
+                      color: iconColor ?? kGovGreen,
+                      size: 22,
+                    ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildFloatingSearch() {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.1),
+            blurRadius: 15,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Row(
+        children: [
+          const Padding(
+            padding: EdgeInsets.only(right: 14, left: 14),
+            child: Icon(Icons.search, color: kGovGreen, size: 22),
+          ),
+          Expanded(
+            child: TextField(
+              controller: _searchController,
+              decoration: const InputDecoration(
+                hintText: 'ابحث عن وزارة أو دائرة...',
+                hintStyle: TextStyle(fontSize: 13, color: Colors.grey),
+                border: InputBorder.none,
+                isDense: true,
+                contentPadding: EdgeInsets.symmetric(vertical: 16),
+              ),
+              onSubmitted: (_) => _searchAddress(_searchController.text),
+            ),
+          ),
+          if (_isSearching)
+            const Padding(
+              padding: EdgeInsets.all(12),
+              child: SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(
+                    strokeWidth: 2, color: kGovGreen),
+              ),
+            )
+          else
+            IconButton(
+              icon: const Icon(Icons.arrow_forward_ios,
+                  size: 16, color: kGovGreen),
+              onPressed: () => _searchAddress(_searchController.text),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildInfoCard() {
+    final hasPolygon = _mainPolygon.isNotEmpty;
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.12),
+            blurRadius: 20,
+            offset: const Offset(0, 5),
+          ),
+        ],
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: kGovGreen.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: _isFetchingBoundary
+                    ? const SizedBox(
+                        width: 22,
+                        height: 22,
+                        child: CircularProgressIndicator(
+                            strokeWidth: 2, color: kGovGreen),
+                      )
+                    : const Icon(Icons.business,
+                        color: kGovGreen, size: 22),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      _nameController.text.isEmpty
+                          ? (hasPolygon ? 'الموقع المحدد' : 'لم يتم التحديد')
+                          : _nameController.text,
+                      style: const TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.bold,
+                        color: kGovGreen,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      '${_selectedLocation.latitude.toStringAsFixed(5)}, ${_selectedLocation.longitude.toStringAsFixed(5)}',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: Colors.grey.shade600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              IconButton(
+                icon: const Icon(Icons.copy, size: 18, color: kGovGold),
+                tooltip: 'نسخ الإحداثيات',
+                onPressed: _copyCoordinates,
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          const Divider(height: 1),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: _infoChip(
+                  icon: Icons.adjust,
+                  label: 'نصف القطر',
+                  value: '${_radiusController.text} م',
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: _infoChip(
+                  icon: hasPolygon ? Icons.check_circle : Icons.info,
+                  label: 'الحالة',
+                  value: hasPolygon ? 'محدد بالكامل' : 'قيد التحديد',
+                  color: hasPolygon ? kGovGreen : kGovGold,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+
+          if (hasPolygon)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  onPressed: () {
+                    setState(() => _isShapeEditable = !_isShapeEditable);
+                    _snack(_isShapeEditable
+                        ? '✅ تم تفعيل وضع التعديل'
+                        : '✅ تم إنهاء التعديل');
+                  },
+                  icon: Icon(
+                    _isShapeEditable ? Icons.check : Icons.edit,
+                    size: 18,
+                    color: Colors.white,
+                  ),
+                  label: Text(
+                    _isShapeEditable ? 'إنهاء التعديل' : 'تعديل الشكل',
+                    style: const TextStyle(
+                        color: Colors.white, fontWeight: FontWeight.w600),
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor:
+                        _isShapeEditable ? kGovGold : kGovGreen,
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: () {
+                setState(() {
+                  _mode = DrawMode.polygon;
+                  _draftPoints.clear();
+                  _isShapeEditable = false;
+                });
+                _snack('ارسم الزوايا، ثم اضغط إنهاء');
+              },
+              icon: const Icon(Icons.edit_location_alt,
+                  size: 18, color: kGovGreen),
+              label: const Text('رسم شكل جديد',
+                  style: TextStyle(
+                      color: kGovGreen, fontWeight: FontWeight.w600)),
+              style: OutlinedButton.styleFrom(
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                side: const BorderSide(color: kGovGreen, width: 1.5),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          SizedBox(
+            width: double.infinity,
+            height: 54,
+            child: ElevatedButton.icon(
+              onPressed: _isLoading ? null : _openFormSheet,
+              icon: _isLoading
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(
+                          color: Colors.white, strokeWidth: 2))
+                  : const Icon(Icons.save, color: Colors.white),
+              label: Text(
+                _isEdit ? 'حفظ التعديلات' : 'حفظ موقع الوزارة',
+                style: const TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white),
+              ),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: kGovGreen,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                elevation: 3,
+                shadowColor: kGovGreen.withOpacity(0.5),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _infoChip({
+    required IconData icon,
+    required String label,
+    required String value,
+    Color? color,
+  }) {
+    final c = color ?? kGovGreen;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: c.withOpacity(0.08),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: c.withOpacity(0.2)),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, size: 16, color: c),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(label,
+                    style:
+                        TextStyle(fontSize: 10, color: Colors.grey.shade600)),
+                const SizedBox(height: 2),
+                Text(value,
+                    style: TextStyle(
+                        fontSize: 12, fontWeight: FontWeight.bold, color: c)),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDrawToolbar({bool expand = false}) {
+    final showDraftTools = _mode == DrawMode.polygon && _draftPoints.isNotEmpty;
+
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(14),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.08),
+            blurRadius: 12,
+            offset: const Offset(0, 3),
+          ),
+        ],
+      ),
+      child: Row(
+        mainAxisSize: expand ? MainAxisSize.max : MainAxisSize.min,
+        children: [
+          _modeIcon(
+            icon: Icons.location_on,
+            mode: DrawMode.point,
+            tooltip: 'نقطة + دائرة',
+          ),
+          const SizedBox(width: 4),
+          _modeIcon(
+            icon: Icons.polyline,
+            mode: DrawMode.polygon,
+            tooltip: 'مضلع',
+          ),
+          const SizedBox(width: 4),
+          _modeIcon(
+            icon: Icons.crop_square,
+            mode: DrawMode.rectangle,
+            tooltip: 'مربع',
+          ),
+          if (showDraftTools) ...[
+            const SizedBox(width: 8),
+            Container(width: 1, height: 24, color: Colors.grey.shade300),
+            const SizedBox(width: 8),
+            IconButton(
+              icon: const Icon(Icons.undo, color: kGovGreen),
+              onPressed: () => setState(() => _draftPoints.removeLast()),
+              tooltip: 'تراجع',
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+            ),
+            IconButton(
+              icon: const Icon(Icons.delete_outline, color: Colors.redAccent),
+              onPressed: () => setState(() => _draftPoints.clear()),
+              tooltip: 'مسح',
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+            ),
+            if (expand) const Spacer() else const SizedBox(width: 8),
+            ElevatedButton.icon(
+              onPressed: _draftPoints.length >= 3 ? _finishPolygon : null,
+              icon: const Icon(Icons.check, size: 16, color: Colors.white),
+              label: const Text('إنهاء',
+                  style: TextStyle(color: Colors.white, fontSize: 12)),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: kGovGreen,
+                disabledBackgroundColor: Colors.grey.shade400,
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8)),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _modeIcon({
+    required IconData icon,
+    required DrawMode mode,
+    required String tooltip,
+  }) {
+    final selected = _mode == mode;
+    return Tooltip(
+      message: tooltip,
+      child: Material(
+        color: selected ? kGovGreen : Colors.transparent,
+        borderRadius: BorderRadius.circular(10),
+        child: InkWell(
+          onTap: () => _setMode(mode),
+          borderRadius: BorderRadius.circular(10),
+          child: SizedBox(
+            width: 40,
+            height: 40,
+            child: Icon(
+              icon,
+              color: selected ? Colors.white : kGovGreen,
+              size: 20,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMap() {
+    final showVertexHandles = _mainPolygon.length >= 3 && _isShapeEditable;
+    final showRadiusHandle =
+        _mainPolygon.isEmpty && double.tryParse(_radiusController.text) != null;
+
+    return FlutterMap(
+      key: _mapKey,
+      mapController: _mapController,
+      options: MapOptions(
+        initialCenter: _selectedLocation,
+        initialZoom: _isEdit ? 16 : 12,
+        minZoom: 6,
+        maxZoom: 19,
+        cameraConstraint: CameraConstraint.contain(bounds: _iraqBounds),
+        interactionOptions: InteractionOptions(
+          flags: _isDraggingHandle
+              ? InteractiveFlag.none
+              : InteractiveFlag.all & ~InteractiveFlag.rotate,
+        ),
+        onTap: (tapPosition, point) => _onMapTap(point),
+      ),
+      children: [
+        if (_isSatelliteView)
+          TileLayer(
+            urlTemplate:
+                'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+            userAgentPackageName: 'com.example.my_first_app',
+            maxZoom: 19,
+          )
+        else
+          TileLayer(
+            urlTemplate:
+                'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}',
+            userAgentPackageName: 'com.example.my_first_app',
+            maxZoom: 19,
+          ),
+
+        // ===== المضلع =====
+        PolygonLayer(
+          polygons: [
+            if (_mainPolygon.isNotEmpty)
+              Polygon(
+                points: _mainPolygon,
+                color: kGovGreen.withOpacity(_isShapeEditable ? 0.25 : 0.35),
+                borderColor: kGovGold,
+                borderStrokeWidth: 3,
+              ),
+          ],
+        ),
+
+        // ===== الدائرة =====
+        CircleLayer(
+          circles: [
+            CircleMarker(
+              point: _selectedLocation,
+              radius: double.tryParse(_radiusController.text) ?? 100,
+              useRadiusInMeter: true,
+              color: kGovGreen.withOpacity(0.15),
+              borderColor: kGovGold,
+              borderStrokeWidth: 3,
+            ),
+          ],
+        ),
+
+        // ===== خط الرسم اليدوي =====
+        if (_draftPoints.length >= 2)
+          PolylineLayer(
+            polylines: [
+              Polyline(
+                points: _draftPoints,
+                color: kGovGold,
+                strokeWidth: 4,
+              ),
+            ],
+          ),
+
+        // ===== العلامات =====
+        MarkerLayer(
+          markers: [
+            for (final p in _draftPoints)
+              Marker(
+                point: p,
+                width: 16,
+                height: 16,
+                child: Container(
+                  decoration: BoxDecoration(
+                    color: kGovGold,
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.white, width: 2.5),
+                    boxShadow: [
+                      BoxShadow(
+                        color: kGovGold.withOpacity(0.5),
+                        blurRadius: 6,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+
+            if (showVertexHandles)
+              for (int i = 0; i < _mainPolygon.length; i++)
+                Marker(
+                  point: _mainPolygon[i],
+                  width: 30,
+                  height: 30,
+                  child: _buildVertexHandle(i),
+                ),
+
+            if (showVertexHandles)
+              Marker(
+                point: LatLngBounds.fromPoints(_mainPolygon).center,
+                width: 50,
+                height: 50,
+                child: _buildCenterHandle(),
+              ),
+
+            if (showRadiusHandle && !_isShapeEditable)
+              Marker(
+                point: const Distance()
+                    .offset(_selectedLocation,
+                        double.tryParse(_radiusController.text) ?? 100, 90),
+                width: 28,
+                height: 28,
+                child: _buildRadiusHandle(),
+              ),
+
+            if (!showVertexHandles)
+              Marker(
+                point: _selectedLocation,
+                width: 60,
+                height: 60,
+                child: _buildProfessionalMarker(),
+              ),
+          ],
+        ),
+
+        const RichAttributionWidget(
+          attributions: [
+            TextSourceAttribution('OpenStreetMap contributors'),
+            TextSourceAttribution('Esri'),
+          ],
+        ),
+      ],
+    );
+  }
+
+  // =====================================================
+  //                  نموذج الحفظ
+  // =====================================================
+
+  void _openFormSheet() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (context, setSheetState) => DraggableScrollableSheet(
+          initialChildSize: 0.65,
+          minChildSize: 0.4,
+          maxChildSize: 0.95,
+          expand: false,
+          builder: (context, scrollController) => Container(
+            decoration: const BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+            ),
+            child: Form(
+              key: _formKey,
+              child: ListView(
+                controller: scrollController,
+                padding: EdgeInsets.fromLTRB(
+                  20,
+                  20,
+                  20,
+                  20 + MediaQuery.of(context).viewInsets.bottom,
+                ),
+                children: [
+                  Center(
+                    child: Container(
+                      width: 40,
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: Colors.grey.shade300,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: kGovGreen.withOpacity(0.1),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: const Icon(Icons.edit_note, color: kGovGreen),
+                      ),
+                      const SizedBox(width: 12),
+                      const Text('معلومات الموقع',
+                          style: TextStyle(
+                              fontSize: 18, fontWeight: FontWeight.bold)),
+                    ],
+                  ),
+                  const SizedBox(height: 20),
+                  TextFormField(
+                    controller: _nameController,
+                    decoration: InputDecoration(
+                      labelText: 'اسم الموقع',
+                      hintText: 'مثال: وزارة التربية',
+                      prefixIcon:
+                          const Icon(Icons.business, color: kGovGreen),
+                      filled: true,
+                      fillColor: kGovCream,
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide.none,
+                      ),
+                      focusedBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide:
+                            const BorderSide(color: kGovGreen, width: 2),
+                      ),
+                    ),
+                    validator: (v) => v == null || v.trim().isEmpty
+                        ? 'اسم الموقع مطلوب'
+                        : null,
+                  ),
+                  const SizedBox(height: 16),
+                  TextFormField(
+                    controller: _radiusController,
+                    keyboardType: TextInputType.number,
+                    onChanged: (_) => setState(() {}),
+                    decoration: InputDecoration(
+                      labelText: 'نصف القطر (بالمتر)',
+                      prefixIcon: const Icon(Icons.adjust, color: kGovGreen),
+                      filled: true,
+                      fillColor: kGovCream,
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide.none,
+                      ),
+                      focusedBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide:
+                            const BorderSide(color: kGovGreen, width: 2),
+                      ),
+                    ),
+                    validator: (v) {
+                      final n = int.tryParse((v ?? '').trim());
+                      if (n == null || n <= 0) return 'أدخل رقماً أكبر من صفر';
+                      return null;
+                    },
+                  ),
+                  const SizedBox(height: 16),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextFormField(
+                          controller: _startController,
+                          readOnly: true,
+                          onTap: () async {
+                            await _pickTime(true);
+                            setSheetState(() {});
+                          },
+                          decoration: InputDecoration(
+                            labelText: 'بدء العمل',
+                            prefixIcon:
+                                const Icon(Icons.login, color: kGovGreen),
+                            filled: true,
+                            fillColor: kGovCream,
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(12),
+                              borderSide: BorderSide.none,
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: TextFormField(
+                          controller: _endController,
+                          readOnly: true,
+                          onTap: () async {
+                            await _pickTime(false);
+                            setSheetState(() {});
+                          },
+                          decoration: InputDecoration(
+                            labelText: 'انتهاء العمل',
+                            prefixIcon:
+                                const Icon(Icons.logout, color: kGovGreen),
+                            filled: true,
+                            fillColor: kGovCream,
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(12),
+                              borderSide: BorderSide.none,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 24),
+                  SizedBox(
+                    height: 54,
+                    child: ElevatedButton.icon(
+                      onPressed:
+                          _isLoading ? null : () => _save(setSheetState),
+                      icon: _isLoading
+                          ? const SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(
+                                  color: Colors.white, strokeWidth: 2),
+                            )
+                          : const Icon(Icons.save, color: Colors.white),
+                      label: Text(
+                        _isEdit ? 'حفظ التعديلات' : 'حفظ موقع الوزارة',
+                        style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.white),
+                      ),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: kGovGreen,
+                        disabledBackgroundColor: Colors.grey.shade400,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        elevation: 3,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // =====================================================
+  //                        الواجهة
+  // =====================================================
+
+  Widget _buildFullscreenMode() {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: SafeArea(
+        child: Stack(
+          children: [
+            _buildMap(),
+            Positioned(
+              top: 12,
+              right: 12,
+              child: _floatingButton(
+                icon: Icons.close,
+                onPressed: () => setState(() => _isFullscreen = false),
+                tooltip: 'إغلاق',
+                bgColor: kGovGreen,
+                iconColor: Colors.white,
+              ),
+            ),
+            Positioned(
+              top: 12,
+              right: 70,
+              left: 12,
+              child: _buildDrawToolbar(expand: true),
+            ),
+            Positioned(
+              top: 76,
+              right: 12,
+              left: 12,
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                decoration: BoxDecoration(
+                  color: kGovGreen.withOpacity(0.95),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.touch_app, size: 16, color: kGovGold),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        _mapHint,
+                        style: const TextStyle(
+                            fontSize: 12, color: Colors.white),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildNormalMode() {
+    return Scaffold(
+      backgroundColor: kGovCream,
+      appBar: AppBar(
+        title: Text(_isEdit ? 'تعديل موقع' : 'تحديد موقع الوزارة'),
+        backgroundColor: kGovGreen,
+        foregroundColor: Colors.white,
+        elevation: 0,
+      ),
+      body: Stack(
+        children: [
+          Positioned.fill(child: _buildMap()),
+          Positioned(
+            top: 12,
+            right: 12,
+            left: 12,
+            child: _buildFloatingSearch(),
+          ),
+          Positioned(
+            top: 76,
+            right: 12,
+            child: _buildDrawToolbar(),
+          ),
+          Positioned(
+            top: 140,
+            left: 12,
+            right: 12,
+            child: IgnorePointer(
+              child: Align(
+                alignment: AlignmentDirectional.centerStart,
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: kGovGreen.withOpacity(0.95),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.info_outline,
+                          size: 14, color: kGovGold),
+                      const SizedBox(width: 6),
+                      Flexible(
+                        child: Text(
+                          _mapHint,
+                          style: const TextStyle(
+                              fontSize: 11, color: Colors.white),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+          Positioned(
+            bottom: 380,
+            right: 12,
+            child: Column(
+              children: [
+                _floatingButton(
+                  icon: _isSatelliteView
+                      ? Icons.map_outlined
+                      : Icons.satellite_alt,
+                  tooltip: _isSatelliteView ? 'خريطة' : 'صور جوية',
+                  onPressed: () {
+                    setState(() => _isSatelliteView = !_isSatelliteView);
+                  },
+                ),
+                _floatingButton(
+                  icon: Icons.fullscreen,
+                  tooltip: 'ملء الشاشة',
+                  onPressed: () => setState(() => _isFullscreen = true),
+                ),
+                _floatingButton(
+                  icon: Icons.my_location,
+                  tooltip: 'موقعي',
+                  isLoading: _isLoadingLocation,
+                  onPressed: _goToMyLocation,
+                ),
+                Container(
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(24),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(0.12),
+                        blurRadius: 10,
+                        offset: const Offset(0, 3),
+                      ),
+                    ],
+                  ),
+                  child: Column(
+                    children: [
+                      Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          onTap: () {
+                            final z = _mapController.camera.zoom;
+                            _mapController.move(
+                                _mapController.camera.center, z + 1);
+                          },
+                          customBorder: const CircleBorder(),
+                          child: const SizedBox(
+                            width: 48,
+                            height: 48,
+                            child: Icon(Icons.add, color: kGovGreen, size: 22),
+                          ),
+                        ),
+                      ),
+                      Container(
+                          height: 1, width: 26, color: Colors.grey.shade200),
+                      Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          onTap: () {
+                            final z = _mapController.camera.zoom;
+                            _mapController.move(
+                                _mapController.camera.center, z - 1);
+                          },
+                          customBorder: const CircleBorder(),
+                          child: const SizedBox(
+                            width: 48,
+                            height: 48,
+                            child: Icon(Icons.remove,
+                                color: kGovGreen, size: 22),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Positioned(
+            bottom: 0,
+            right: 0,
+            left: 0,
+            child: _buildInfoCard(),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      canPop: !_isFullscreen,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && _isFullscreen) {
+          setState(() => _isFullscreen = false);
+        }
+      },
+      child: _isFullscreen ? _buildFullscreenMode() : _buildNormalMode(),
+    );
+  }
+}
